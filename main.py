@@ -122,7 +122,7 @@ def skill_overlap(project_skills, mentor_skills):
     return len(set(project_skills) & set(mentor_skills))
 
 # -------------------------
-# Request Schema
+# Request Schemas
 # -------------------------
 class ProjectRequest(BaseModel):
     project_name: str
@@ -130,6 +130,50 @@ class ProjectRequest(BaseModel):
     difficulty: str
     skills: list[str]
     tools: list[str]
+
+class StudentRequest(BaseModel):
+    student_id: str
+    skills: list[str]
+    learning_goals: list[str]
+    topics: list[str]
+    preferred_difficulty: str
+    learning_mode: str
+
+# -------------------------
+# Text builders
+# -------------------------
+def student_to_text(s: StudentRequest):
+    return f"""
+    Student skills: {' '.join(s.skills)}
+    Learning goals: {' '.join(s.learning_goals)}
+    Topics of interest: {' '.join(s.topics)}
+    Preferred difficulty: {s.preferred_difficulty}
+    Learning mode: {s.learning_mode}
+    """
+
+def score_mentors(query_embedding, mentors, query_skills: list[str]):
+    mentor_texts = [mentor_to_text(m) for m in mentors]
+    mentor_embeddings = model.encode(mentor_texts)
+
+    results = []
+    for i, m in enumerate(mentors):
+        sim = cosine_similarity(query_embedding, mentor_embeddings[i])
+
+        mentor_skills = extract_skills(m["skills"])
+        overlap = skill_overlap(query_skills, mentor_skills)
+        overlap = overlap / len(query_skills) if query_skills else 0
+
+        final_score = (sim * 0.7) + (overlap * 0.3)
+
+        results.append({
+            "mentorId": m["mentorId"],
+            "name": m["name"],
+            "jobTitle": m["jobTitle"],
+            "score": round(final_score, 4)
+        })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
 
 # -------------------------
 # Routes
@@ -143,7 +187,7 @@ def home():
 def test_db():
     mentors = fetch_mentors_from_db()
 
-    if isinstance(mentors, dict):  
+    if isinstance(mentors, dict):
         return mentors
 
     return {
@@ -153,7 +197,6 @@ def test_db():
 
 @app.post("/match")
 def match_project(project: ProjectRequest):
-
     mentors = fetch_mentors_from_db()
 
     if isinstance(mentors, dict):
@@ -163,28 +206,21 @@ def match_project(project: ProjectRequest):
         return {"error": "No mentors found"}
 
     project_embedding = model.encode(project_to_text(project))
+    query_skills = [normalize_skill(s) for s in project.skills]
 
-    mentor_texts = [mentor_to_text(m) for m in mentors]
-    mentor_embeddings = model.encode(mentor_texts)
+    return score_mentors(project_embedding, mentors, query_skills)[:3]
 
-    results = []
+@app.post("/match/student")
+def match_student(student: StudentRequest):
+    mentors = fetch_mentors_from_db()
 
-    for i, m in enumerate(mentors):
-        sim = cosine_similarity(project_embedding, mentor_embeddings[i])
+    if isinstance(mentors, dict):
+        return mentors
 
-        mentor_skills = extract_skills(m["skills"])
-        overlap = skill_overlap(project.skills, mentor_skills)
-        overlap = overlap / len(project.skills) if project.skills else 0
+    if not mentors:
+        return {"error": "No mentors found"}
 
-        final_score = (sim * 0.7) + (overlap * 0.3)
+    student_embedding = model.encode(student_to_text(student))
+    query_skills = [normalize_skill(s) for s in student.skills + student.learning_goals]
 
-        results.append({
-            "mentorId": m["mentorId"],
-            "name": m["name"],
-            "jobTitle": m["jobTitle"],
-            "score": round(final_score, 4)
-        })
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-
-    return results[:3]
+    return score_mentors(student_embedding, mentors, query_skills)
