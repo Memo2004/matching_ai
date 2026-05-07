@@ -1,15 +1,14 @@
+import os
+import cohere
+import numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
-import torch
-import torch.nn.functional as F
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 app = FastAPI()
 
-
-model = SentenceTransformer('all-mpnet-base-v2')
+co = cohere.Client(os.getenv("COHERE_API_KEY"))
 
 # -------------------------
 # Database
@@ -91,69 +90,64 @@ def clean_text(text):
         return ""
     return text.lower().replace("\n", " ").strip()
 
-def project_to_text(p):
-    return f"""
-    Project: {p.project_name}
-    Description: {p.description}
-    Required skills: {' '.join(p.skills)}
-    Tools: {' '.join(p.tools)}
-    Difficulty: {p.difficulty}
-    """
-
-def mentor_to_text(m):
-    skills = [normalize_skill(s) for s in extract_skills(m["skills"])]
-    bio = clean_text(m["bio"])
-    job = m['jobTitle'] if m['jobTitle'] else "mentor"
-
-    return f"""
-    Mentor job: {job}
-    Experience: {m['yearsOfExperience']} years
-    Skills: {' '.join(skills)}
-    Bio: {bio}
-    """
-
 def cosine_similarity(a, b):
-    a = torch.tensor(a)
-    b = torch.tensor(b)
-    return F.cosine_similarity(a, b, dim=0).item()
+    a = np.array(a, dtype=float)
+    b = np.array(b, dtype=float)
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
 
-def skill_overlap(project_skills, mentor_skills):
+def skill_overlap(query_skills, mentor_skills):
     mentor_skills = [normalize_skill(s) for s in mentor_skills]
-    return len(set(project_skills) & set(mentor_skills))
+    return len(set(query_skills) & set(mentor_skills))
 
-# -------------------------
-# Request Schemas
-# -------------------------
-class ProjectRequest(BaseModel):
-    project_name: str
-    description: str
-    difficulty: str
-    skills: list[str]
-    tools: list[str]
-
-class StudentRequest(BaseModel):
-    student_id: str
-    skills: list[str]
-    learning_goals: list[str]
-    topics: list[str]
-    preferred_difficulty: str
-    learning_mode: str
+def embed_texts(texts: list[str], input_type: str) -> list:
+    response = co.embed(
+        texts=texts,
+        model="embed-english-v3.0",
+        input_type=input_type,
+    )
+    return response.embeddings
 
 # -------------------------
 # Text builders
 # -------------------------
-def student_to_text(s: StudentRequest):
-    return f"""
-    Student skills: {' '.join(s.skills)}
-    Learning goals: {' '.join(s.learning_goals)}
-    Topics of interest: {' '.join(s.topics)}
-    Preferred difficulty: {s.preferred_difficulty}
-    Learning mode: {s.learning_mode}
-    """
+def project_to_text(p):
+    return (
+        f"Project: {p.project_name}. "
+        f"Description: {p.description}. "
+        f"Required skills: {', '.join(p.skills)}. "
+        f"Tools: {', '.join(p.tools)}. "
+        f"Difficulty: {p.difficulty}."
+    )
 
+def mentor_to_text(m):
+    skills = [normalize_skill(s) for s in extract_skills(m["skills"])]
+    bio = clean_text(m["bio"])
+    job = m["jobTitle"] if m["jobTitle"] else "mentor"
+    return (
+        f"Job: {job}. "
+        f"Experience: {m['yearsOfExperience']} years. "
+        f"Skills: {', '.join(skills)}. "
+        f"Bio: {bio}."
+    )
+
+def student_to_text(s):
+    return (
+        f"Current skills: {', '.join(s.skills)}. "
+        f"Learning goals: {', '.join(s.learning_goals)}. "
+        f"Topics of interest: {', '.join(s.topics)}. "
+        f"Preferred difficulty: {s.preferred_difficulty}. "
+        f"Learning mode: {s.learning_mode}."
+    )
+
+# -------------------------
+# Scoring
+# -------------------------
 def score_mentors(query_embedding, mentors, query_skills: list[str]):
     mentor_texts = [mentor_to_text(m) for m in mentors]
-    mentor_embeddings = model.encode(mentor_texts)
+    mentor_embeddings = embed_texts(mentor_texts, input_type="search_document")
 
     results = []
     for i, m in enumerate(mentors):
@@ -176,51 +170,59 @@ def score_mentors(query_embedding, mentors, query_skills: list[str]):
     return results
 
 # -------------------------
+# Request Schemas
+# -------------------------
+class ProjectRequest(BaseModel):
+    project_name: str
+    description: str
+    difficulty: str
+    skills: list[str]
+    tools: list[str]
+
+class StudentRequest(BaseModel):
+    student_id: str
+    skills: list[str]
+    learning_goals: list[str]
+    topics: list[str]
+    preferred_difficulty: str
+    learning_mode: str
+
+# -------------------------
 # Routes
 # -------------------------
-
 @app.get("/")
 def home():
-    return {"message": "API is working "}
+    return {"message": "API is working"}
 
 @app.get("/test-db")
 def test_db():
     mentors = fetch_mentors_from_db()
-
     if isinstance(mentors, dict):
         return mentors
-
-    return {
-        "count": len(mentors),
-        "sample": mentors[:1]
-    }
+    return {"count": len(mentors), "sample": mentors[:1]}
 
 @app.post("/match")
 def match_project(project: ProjectRequest):
     mentors = fetch_mentors_from_db()
-
     if isinstance(mentors, dict):
         return mentors
-
     if not mentors:
         return {"error": "No mentors found"}
 
-    project_embedding = model.encode(project_to_text(project))
+    query_embedding = embed_texts([project_to_text(project)], input_type="search_query")[0]
     query_skills = [normalize_skill(s) for s in project.skills]
 
-    return score_mentors(project_embedding, mentors, query_skills)[:3]
+    return score_mentors(query_embedding, mentors, query_skills)[:3]
 
 @app.post("/match/student")
 def match_student(student: StudentRequest):
     mentors = fetch_mentors_from_db()
-
     if isinstance(mentors, dict):
         return mentors
-
     if not mentors:
         return {"error": "No mentors found"}
 
-    student_embedding = model.encode(student_to_text(student))
+    query_embedding = embed_texts([student_to_text(student)], input_type="search_query")[0]
     query_skills = [normalize_skill(s) for s in student.skills + student.learning_goals]
 
-    return score_mentors(student_embedding, mentors, query_skills)
+    return score_mentors(query_embedding, mentors, query_skills)

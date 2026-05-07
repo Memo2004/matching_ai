@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-sentence-transformers
-torch
+cohere
+numpy
 psycopg2-binary
