@@ -1,92 +1,128 @@
-import os
-import math
-import cohere
-import psycopg2
 from fastapi import FastAPI
 from pydantic import BaseModel
-from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
+import torch
+import torch.nn.functional as F
+import psycopg2
 from psycopg2.extras import RealDictCursor
-
-# Load environment variables
-load_dotenv()
 
 app = FastAPI()
 
-# Initialize Cohere client
-COHERE_KEY = os.getenv("COHERE_API_KEY")
-co = cohere.Client(COHERE_KEY)
+
+model = SentenceTransformer('all-mpnet-base-v2')
 
 # -------------------------
-# Database Logic
+# Database
 # -------------------------
 def fetch_mentors_from_db():
     conn = None
     try:
         conn = psycopg2.connect(
-            host=os.getenv("DB_HOST"),
-            port=os.getenv("DB_PORT"),
-            database=os.getenv("DB_NAME"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
+            host="ep-icy-mouse-a4rz6n2f-pooler.us-east-1.aws.neon.tech",
+            port=5432,
+            database="neondb",
+            user="neondb_owner",
+            password="npg_UBNtL0bo8MVQ",
             sslmode="require"
         )
+
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
+
         query = """
-            SELECT 
-                mp.id AS "mentorId", u."firstName", u."lastName", u.bio,
-                mp."jobTitle", mp."yearsOfExperience", ms."skillName", ms."level"
+            SELECT
+                mp.id AS "mentorId",
+                u."firstName",
+                u."lastName",
+                u.bio,
+                mp."jobTitle",
+                mp."yearsOfExperience",
+                ms."skillName",
+                ms."level"
             FROM public."MentorProfile" mp
             JOIN public."User" u ON mp."userId" = u.id
             LEFT JOIN public."MentorSkill" ms ON ms."mentorId" = mp.id
             WHERE mp."isAvailable" = true;
         """
+
         cursor.execute(query)
         rows = cursor.fetchall()
-        
+
         mentors_dict = {}
+
         for row in rows:
-            m_id = row['mentorId']
-            if m_id not in mentors_dict:
-                mentors_dict[m_id] = {
-                    "mentorId": m_id,
+            mentor_id = row['mentorId']
+
+            if mentor_id not in mentors_dict:
+                mentors_dict[mentor_id] = {
+                    "mentorId": mentor_id,
                     "name": f"{row['firstName']} {row['lastName']}",
                     "bio": row['bio'],
                     "jobTitle": row['jobTitle'],
                     "yearsOfExperience": row['yearsOfExperience'],
                     "skills": []
                 }
+
             if row['skillName']:
-                mentors_dict[m_id]["skills"].append({"skillName": row['skillName'], "level": row['level']})
-        
+                mentors_dict[mentor_id]["skills"].append({
+                    "skillName": row['skillName'],
+                    "level": row['level']
+                })
+
         cursor.close()
         return list(mentors_dict.values())
+
     except Exception as e:
         return {"error": str(e)}
     finally:
-        if conn: conn.close()
+        if conn:
+            conn.close()
 
 # -------------------------
 # Helpers
 # -------------------------
+def extract_skills(skill_list):
+    return [s["skillName"].lower() for s in skill_list]
+
 def normalize_skill(skill):
-    return skill.lower().replace("5", "").strip()
+    return skill.lower().replace("5", "")
+
+def clean_text(text):
+    if not text:
+        return ""
+    return text.lower().replace("\n", " ").strip()
 
 def project_to_text(p):
-    return f"Project: {p.project_name}. Description: {p.description}. Skills: {', '.join(p.skills)}. Tools: {', '.join(p.tools)}."
+    return f"""
+    Project: {p.project_name}
+    Description: {p.description}
+    Required skills: {' '.join(p.skills)}
+    Tools: {' '.join(p.tools)}
+    Difficulty: {p.difficulty}
+    """
 
 def mentor_to_text(m):
-    skills = [normalize_skill(s["skillName"]) for s in m["skills"]]
-    return f"Job: {m['jobTitle'] or 'Mentor'}. Skills: {', '.join(skills)}. Bio: {m['bio'] or ''}."
+    skills = [normalize_skill(s) for s in extract_skills(m["skills"])]
+    bio = clean_text(m["bio"])
+    job = m['jobTitle'] if m['jobTitle'] else "mentor"
 
-def cosine_similarity(v1, v2):
-    dot_product = sum(x * y for x, y in zip(v1, v2))
-    mag1 = math.sqrt(sum(x**2 for x in v1))
-    mag2 = math.sqrt(sum(x**2 for x in v2))
-    return dot_product / (mag1 * mag2) if mag1 * mag2 > 0 else 0
+    return f"""
+    Mentor job: {job}
+    Experience: {m['yearsOfExperience']} years
+    Skills: {' '.join(skills)}
+    Bio: {bio}
+    """
+
+def cosine_similarity(a, b):
+    a = torch.tensor(a)
+    b = torch.tensor(b)
+    return F.cosine_similarity(a, b, dim=0).item()
+
+def skill_overlap(project_skills, mentor_skills):
+    mentor_skills = [normalize_skill(s) for s in mentor_skills]
+    return len(set(project_skills) & set(mentor_skills))
 
 # -------------------------
-# Schema & Routes
+# Request Schemas
 # -------------------------
 class ProjectRequest(BaseModel):
     project_name: str
@@ -95,51 +131,96 @@ class ProjectRequest(BaseModel):
     skills: list[str]
     tools: list[str]
 
-@app.get("/")
-def home():
-    return {"status": "online", "engine": "Cohere API"}
+class StudentRequest(BaseModel):
+    student_id: str
+    skills: list[str]
+    learning_goals: list[str]
+    topics: list[str]
+    preferred_difficulty: str
+    learning_mode: str
 
-@app.post("/match")
-def match_project(project: ProjectRequest):
-    mentors = fetch_mentors_from_db()
-    if not mentors or isinstance(mentors, dict):
-        return mentors if mentors else {"error": "No mentors available"}
+# -------------------------
+# Text builders
+# -------------------------
+def student_to_text(s: StudentRequest):
+    return f"""
+    Student skills: {' '.join(s.skills)}
+    Learning goals: {' '.join(s.learning_goals)}
+    Topics of interest: {' '.join(s.topics)}
+    Preferred difficulty: {s.preferred_difficulty}
+    Learning mode: {s.learning_mode}
+    """
 
-    # Convert project and mentors to text format
-    p_text = project_to_text(project)
-    m_texts = [mentor_to_text(m) for m in mentors]
-    
-    # Batch request to Cohere for Embeddings
-    response = co.embed(
-        texts=[p_text] + m_texts,
-        model='embed-multilingual-v3.0',
-        input_type='search_query'
-    )
-    
-    embeddings = response.embeddings
-    project_emb = embeddings[0]
-    mentor_embs = embeddings[1:]
+def score_mentors(query_embedding, mentors, query_skills: list[str]):
+    mentor_texts = [mentor_to_text(m) for m in mentors]
+    mentor_embeddings = model.encode(mentor_texts)
 
     results = []
-    project_skills_set = set(s.lower() for s in project.skills)
-
     for i, m in enumerate(mentors):
-        # 1. Semantic Similarity Score (AI)
-        sim_score = cosine_similarity(project_emb, mentor_embs[i])
-        
-        # 2. Skill Overlap Score (Keyword matching)
-        m_skills_set = set(s['skillName'].lower() for s in m['skills'])
-        overlap = len(project_skills_set & m_skills_set)
-        overlap_score = overlap / len(project_skills_set) if project_skills_set else 0
-        
-        # Weighted final score (70% AI / 30% Keywords)
-        final_score = (sim_score * 0.7) + (overlap_score * 0.3)
-        
+        sim = cosine_similarity(query_embedding, mentor_embeddings[i])
+
+        mentor_skills = extract_skills(m["skills"])
+        overlap = skill_overlap(query_skills, mentor_skills)
+        overlap = overlap / len(query_skills) if query_skills else 0
+
+        final_score = (sim * 0.7) + (overlap * 0.3)
+
         results.append({
             "mentorId": m["mentorId"],
             "name": m["name"],
+            "jobTitle": m["jobTitle"],
             "score": round(final_score, 4)
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:3]
+    return results
+
+# -------------------------
+# Routes
+# -------------------------
+
+@app.get("/")
+def home():
+    return {"message": "API is working "}
+
+@app.get("/test-db")
+def test_db():
+    mentors = fetch_mentors_from_db()
+
+    if isinstance(mentors, dict):
+        return mentors
+
+    return {
+        "count": len(mentors),
+        "sample": mentors[:1]
+    }
+
+@app.post("/match")
+def match_project(project: ProjectRequest):
+    mentors = fetch_mentors_from_db()
+
+    if isinstance(mentors, dict):
+        return mentors
+
+    if not mentors:
+        return {"error": "No mentors found"}
+
+    project_embedding = model.encode(project_to_text(project))
+    query_skills = [normalize_skill(s) for s in project.skills]
+
+    return score_mentors(project_embedding, mentors, query_skills)[:3]
+
+@app.post("/match/student")
+def match_student(student: StudentRequest):
+    mentors = fetch_mentors_from_db()
+
+    if isinstance(mentors, dict):
+        return mentors
+
+    if not mentors:
+        return {"error": "No mentors found"}
+
+    student_embedding = model.encode(student_to_text(student))
+    query_skills = [normalize_skill(s) for s in student.skills + student.learning_goals]
+
+    return score_mentors(student_embedding, mentors, query_skills)
